@@ -16,6 +16,9 @@ import psutil
 import json
 import asyncio
 import gc
+import uuid
+import threading
+import math as _math
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Form, Request
@@ -31,33 +34,160 @@ from backend.ops.progress_store import get_progress_store
 router = APIRouter(prefix="/ops", tags=["运维监控"])
 
 # ================================================================
-#  RAG 评估任务管理（异步后台执行 + 轮询）
+#  RAG 评估任务管理（异步后台执行 + 轮询 + 跨进程持久化）
 # ================================================================
-# 任务状态存储：{task_id: {"status": "pending|running|completed|failed",
-#                           "result": {...},
-#                           "error": "...",
-#                           "created_at": timestamp,
-#                           "updated_at": timestamp,
-#                           "progress": {"current": N, "total": N}}}
-_eval_task_store: dict = {}
-_eval_task_lock = None  # 延迟初始化 asyncio.Lock
+# 说明：_eval_task_store 原本使用进程内 dict，多 worker 部署时
+#       （如 Linux 下 uvicorn --workers=N）不同 worker 读写不同副本，
+#       导致提交任务的 worker 与 轮询状态的 worker 间状态不同步，
+#       前端永远处于"评估中"。现改为 JSON 文件持久化：
+#         - 每个 task 一个独立文件：{TASK_DIR}/{task_id}.json
+#         - 写操作使用 tempfile + os.replace 原子替换，避免半写文件
+#         - 读操作直接 read 最新文件，所有 worker 看到同一状态
+# ================================================================
+
+_EVAL_TASK_DIR = os.path.join(
+    os.environ.get("OPS_TASK_DIR") or tempfile.gettempdir(),
+    "ai_customer_system_eval_tasks",
+)
+_EVAL_TASK_TTL_SECONDS = int(os.environ.get("OPS_TASK_TTL", str(2 * 3600)))  # 2 小时
+
+try:
+    os.makedirs(_EVAL_TASK_DIR, exist_ok=True)
+except Exception:
+    pass
 
 
-def _get_eval_lock():
-    """延迟初始化锁，避免在非事件循环线程中创建 asyncio.Lock"""
-    global _eval_task_lock
-    if _eval_task_lock is None:
+def _task_file(task_id: str) -> str:
+    """返回 task_id 对应的存储文件路径（做文件名安全清洗）"""
+    safe_id = "".join(c for c in task_id if c.isalnum() or c in "-_").strip() or "unknown"
+    return os.path.join(_EVAL_TASK_DIR, f"eval_{safe_id}.json")
+
+
+def _read_task(task_id: str):
+    """从文件读取任务状态；不存在/损坏返回 None"""
+    path = _task_file(task_id)
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        return data
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"[RAG评估] 读取任务状态失败 task_id={task_id}: {e}")
+        return None
+
+
+def _write_task(task_id: str, data: dict) -> bool:
+    """原子写入任务状态：先写 .tmp → os.replace 替换目标文件"""
+    path = _task_file(task_id)
+    try:
+        # 写入带时间戳，便于后续 TTL 清理 & 调试
+        payload = dict(data)
+        payload.setdefault("task_id", task_id)
+
+        dir_name = os.path.dirname(path)
+        os.makedirs(dir_name, exist_ok=True)
+
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=os.path.basename(path) + ".",
+            suffix=".tmp",
+            dir=dir_name,
+        )
         try:
-            _eval_task_lock = asyncio.Lock()
-        except RuntimeError:
-            # 非 async 上下文时降级为简单的 dict（单线程写一般没问题）
-            _eval_task_lock = None
-    return _eval_task_lock
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            # 原子替换：Linux/Windows 上 os.replace 均为原子操作
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        return True
+    except Exception as e:
+        logger.warning(f"[RAG评估] 写入任务状态失败 task_id={task_id}: {e}")
+        return False
 
 
-import uuid
-import threading
-import math as _math
+def _upsert_task(task_id: str, patch: dict) -> dict:
+    """读取-合并-写入，保证每次写入都保留 created_at 等字段"""
+    current = _read_task(task_id) or {"task_id": task_id}
+    current.update(patch)
+    current["updated_at"] = time.time()
+    current["task_id"] = task_id
+    _write_task(task_id, current)
+    return current
+
+
+def _cleanup_expired_tasks():
+    """后台清理超过 TTL 的任务文件（首次访问时触发）"""
+    try:
+        now = time.time()
+        for name in os.listdir(_EVAL_TASK_DIR):
+            if not name.startswith("eval_") or not name.endswith(".json"):
+                continue
+            path = os.path.join(_EVAL_TASK_DIR, name)
+            try:
+                mtime = os.path.getmtime(path)
+                if now - mtime > _EVAL_TASK_TTL_SECONDS:
+                    os.unlink(path)
+            except OSError:
+                continue
+    except Exception as e:
+        logger.debug(f"[RAG评估] 过期文件清理失败: {e}")
+
+
+_last_cleanup_ts = 0.0
+_cleanup_lock = threading.Lock()
+
+
+def _maybe_cleanup_expired():
+    """每 5 分钟最多触发一次过期清理，避免频繁扫描目录"""
+    global _last_cleanup_ts
+    now = time.time()
+    if now - _last_cleanup_ts < 300:
+        return
+    with _cleanup_lock:
+        if now - _last_cleanup_ts < 300:
+            return
+        _last_cleanup_ts = now
+        _cleanup_expired_tasks()
+
+
+# 向后兼容：保留 dict-like 接口，底层走文件存储
+class _FileBackedTaskStore:
+    """为遗留代码 `_eval_task_store[tid] = x` / `.get(tid)` 提供适配"""
+
+    def __setitem__(self, key, value):
+        data = value if isinstance(value, dict) else {"value": value}
+        data.setdefault("created_at", time.time())
+        data["updated_at"] = time.time()
+        data["task_id"] = key
+        _write_task(key, data)
+
+    def __getitem__(self, key):
+        v = _read_task(key)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def get(self, key, default=None):
+        v = _read_task(key)
+        return v if v is not None else default
+
+    def __contains__(self, key):
+        return _read_task(key) is not None
+
+
+_eval_task_store = _FileBackedTaskStore()
 
 
 def _safe_float_json(v):
@@ -103,73 +233,97 @@ def _clean_eval_result_for_json(result):
 
 
 def _run_eval_background_sync(task_id: str, test_cases: list, settings_obj):
-    """后台线程同步执行评估（不阻塞 HTTP 请求）"""
+    """后台线程同步执行评估（不阻塞 HTTP 请求；跨 worker 文件持久化状态）"""
+    total_cases = len(test_cases) if test_cases else 0
+
     try:
         from backend.evaluation.rag_runner import run_evaluation
+    except Exception as e:
+        logger.exception(f"[RAG评估][{task_id}] 导入评估 runner 失败: {e}")
+        _upsert_task(
+            task_id,
+            {
+                "status": "failed",
+                "result": None,
+                "error": f"runner_import_error: {type(e).__name__}: {e}",
+                "progress": {"current": 0, "total": total_cases},
+            },
+        )
+        return
 
-        total_cases = len(test_cases)
-        logger.info(f"[RAG评估][{task_id}] 后台任务开始，{total_cases} 个用例")
-
-        # 更新状态为 running
-        store = _eval_task_store
-        store[task_id] = {
+    # 初始化状态为 running（保留由 HTTP 线程写入的 created_at）
+    _upsert_task(
+        task_id,
+        {
             "status": "running",
             "result": None,
             "error": None,
-            "created_at": store.get(task_id, {}).get("created_at", time.time()),
-            "updated_at": time.time(),
             "progress": {"current": 0, "total": total_cases},
+        },
+    )
+    logger.info(f"[RAG评估][{task_id}] 后台任务开始，{total_cases} 个用例")
+
+    # 进度回调：每 5 条或到最后一条时打日志；每次均写文件，使任何 worker 都能读到
+    def _progress_cb(current, total, case_id):
+        patch = {
+            "progress": {"current": current, "total": total},
         }
+        # 避免在进度回调里为每次都做 os.replace，这里仅在 5 的倍数或最后一条时写文件
+        # 但任何 worker 的轮询都应该能看到合理的进度，所以至少每 5 条写一次
+        if current % 5 == 0 or current == total:
+            _upsert_task(task_id, patch)
+            logger.info(f"[RAG评估][{task_id}] 进度 {current}/{total}")
 
-        def _progress_cb(current, total, case_id):
-            store[task_id]["progress"] = {"current": current, "total": total}
-            store[task_id]["updated_at"] = time.time()
-            if current % 5 == 0 or current == total:
-                logger.info(f"[RAG评估][{task_id}] 进度 {current}/{total}")
-
-        # 执行评估（用配置参数）
+    summary = None
+    try:
         summary = run_evaluation(
             test_cases,
             eval_concurrency=getattr(settings_obj, "eval_concurrency", 3),
             batch_size=getattr(settings_obj, "eval_batch_size", 5),
             progress_callback=_progress_cb,
         )
+    except Exception as e:
+        logger.exception(f"[RAG评估][{task_id}] 评估执行异常: {e}")
+        _upsert_task(
+            task_id,
+            {
+                "status": "failed",
+                "result": None,
+                "error": f"eval_error: {type(e).__name__}: {e}",
+                "progress": {"current": 0, "total": total_cases},
+            },
+        )
+        del summary
+        gc.collect()
+        return
 
+    # 评估成功：记录日志 + 序列化 + 写入 completed 状态
+    try:
         logger.info(
             f"[RAG评估][{task_id}] 完成: overall={summary.avg_overall:.3f}, "
             f"success={summary.successful_cases}/{summary.total_cases}"
         )
+    except Exception:
+        # summary 对象可能不可访问，继续写结果
+        logger.info(f"[RAG评估][{task_id}] 完成")
 
-        # 转为 JSON 安全的结果
-        cleaned_result = _clean_eval_result_for_json(summary)
+    # 转为 JSON 安全的结果（兜底：失败则写入带错误的 result）
+    cleaned_result = _clean_eval_result_for_json(summary)
 
-        store[task_id] = {
+    _upsert_task(
+        task_id,
+        {
             "status": "completed",
             "result": cleaned_result,
             "error": None,
-            "created_at": store[task_id].get("created_at", time.time()),
-            "updated_at": time.time(),
             "progress": {"current": total_cases, "total": total_cases},
-        }
+        },
+    )
 
-        # 清理大对象引用
-        del summary
-        del cleaned_result
-        gc.collect()
-
-    except Exception as e:
-        logger.exception(f"[RAG评估][{task_id}] 后台任务异常: {e}")
-        store = _eval_task_store
-        created = store.get(task_id, {}).get("created_at", time.time())
-        store[task_id] = {
-            "status": "failed",
-            "result": None,
-            "error": f"{type(e).__name__}: {e}",
-            "created_at": created,
-            "updated_at": time.time(),
-            "progress": {"current": 0, "total": len(test_cases) if test_cases else 0},
-        }
-        gc.collect()
+    # 清理大对象引用
+    del summary
+    del cleaned_result
+    gc.collect()
 
 
 # ================================================================
@@ -1334,6 +1488,8 @@ def run_rag_evaluation(payload: dict = {}):
     }
     """
     try:
+        _maybe_cleanup_expired()
+
         from backend.evaluation.rag_test_cases import get_default_test_cases
         from backend.config import settings as _settings
 
@@ -1399,6 +1555,7 @@ def get_evaluation_status(task_id: str):
       - failed:    评估失败（含 error 信息）
       - not_found: 任务 ID 不存在或已过期
     """
+    _maybe_cleanup_expired()
     task = _eval_task_store.get(task_id)
 
     if task is None:
@@ -1410,6 +1567,32 @@ def get_evaluation_status(task_id: str):
     progress = task.get("progress", {"current": 0, "total": 0})
     created_at = task.get("created_at", 0)
     updated_at = task.get("updated_at", 0)
+
+    # 超时保护：running 状态超过 30 分钟无更新，标记为 failed
+    if status == "running":
+        now = time.time()
+        last_update = updated_at or created_at or now
+        if now - last_update > 1800:
+            logger.warning(
+                f"[RAG评估][{task_id}] running 状态超过 30 分钟无更新，"
+                f"判定为超时失败"
+            )
+            _upsert_task(
+                task_id,
+                {
+                    "status": "failed",
+                    "result": None,
+                    "error": "timeout: 评估执行超过 30 分钟无进度更新，已判定为失败",
+                },
+            )
+            return {
+                "status": "failed",
+                "task_id": task_id,
+                "error": "评估超时（30 分钟无进度更新）",
+                "created_at": created_at,
+                "updated_at": time.time(),
+                "progress": progress,
+            }
 
     # 安全校验：确保 result（即便 None 以外）始终是 JSON 可序列化的 dict
     if status == "completed" and result is not None:
